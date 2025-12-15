@@ -32,7 +32,7 @@ async function run() {
     const tuitionsCollection = db.collection("tuitions");
 
     // USERS APIs--------------->
-    // CREATE USER
+
     app.post("/users", async (req, res) => {
       const user = req.body;
       user.createdAt = new Date();
@@ -43,11 +43,12 @@ async function run() {
       const result = await usersCollection.insertOne(user);
       res.send(result);
     });
-    // GET USER ROLE
+
     app.get("/users/:email/role", async (req, res) => {
       const user = await usersCollection.findOne({ email: req.params.email });
       res.send({ role: user?.role || "student" });
     });
+
     // TUTORS APIs--------------->
     app.post("/tutors", async (req, res) => {
       const tutor = req.body;
@@ -65,8 +66,18 @@ async function run() {
 
     // TUITIONS APIs--------------->
     app.get("/tuitions", async (req, res) => {
+      const email = req.query.email;
+
       const query = {};
-      const result = await tuitionsCollection.find(query).toArray();
+      if (email) {
+        query.studentEmail = email;
+      }
+
+      const result = await tuitionsCollection
+        .find(query)
+        .sort({ createdAt: -1 })
+        .toArray();
+
       res.send(result);
     });
     app.get("/tuitions/:id", async (req, res) => {
@@ -83,6 +94,15 @@ async function run() {
         console.error(error);
         res.status(500).json({ message: "Failed to fetch tuition" });
       }
+    });
+    app.post("/tuitions", async (req, res) => {
+      const tuition = req.body;
+      tuition.createdAt = new Date();
+      tuition.status = "active";
+      tuition.appliedTutors = [];
+
+      const result = await tuitionsCollection.insertOne(tuition);
+      res.send(result);
     });
     // Send a ping to confirm a successful connection
     await client.db("admin").command({ ping: 1 });
