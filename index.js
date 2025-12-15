@@ -58,6 +58,7 @@ async function run() {
       const result = await tutorsCollection.insertOne(tutor);
       res.send(result);
     });
+
     app.get("/tutors", async (req, res) => {
       const query = {};
       const result = await tutorsCollection.find(query).toArray();
@@ -80,6 +81,7 @@ async function run() {
 
       res.send(result);
     });
+
     app.get("/tuitions/:id", async (req, res) => {
       try {
         const id = req.params.id;
@@ -95,6 +97,7 @@ async function run() {
         res.status(500).json({ message: "Failed to fetch tuition" });
       }
     });
+
     app.post("/tuitions", async (req, res) => {
       const tuition = req.body;
       tuition.createdAt = new Date();
@@ -104,6 +107,38 @@ async function run() {
       const result = await tuitionsCollection.insertOne(tuition);
       res.send(result);
     });
+
+    app.patch("/tuitions/:id", async (req, res) => {
+      const id = req.params.id;
+      const updatedData = req.body;
+
+      const result = await tuitionsCollection.updateOne(
+        { _id: new ObjectId(id) },
+        { $set: updatedData }
+      );
+
+      res.send(result);
+    });
+
+    app.delete("/tuitions/:id", async (req, res) => {
+      try {
+        const id = req.params.id;
+
+        const result = await tuitionsCollection.deleteOne({
+          _id: new ObjectId(id),
+        });
+
+        if (result.deletedCount === 0) {
+          return res.status(404).json({ message: "Tuition not found" });
+        }
+
+        res.json({ message: "Tuition deleted successfully" });
+      } catch (error) {
+        console.error(error);
+        res.status(500).json({ message: "Failed to delete tuition" });
+      }
+    });
+
     // Send a ping to confirm a successful connection
     await client.db("admin").command({ ping: 1 });
     console.log(
