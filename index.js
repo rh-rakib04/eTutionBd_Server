@@ -30,6 +30,7 @@ async function run() {
     const usersCollection = db.collection("users");
     const tutorsCollection = db.collection("tutors");
     const tuitionsCollection = db.collection("tuitions");
+    const applicationsCollection = db.collection("applications");
 
     // USERS APIs--------------->
 
@@ -63,6 +64,106 @@ async function run() {
       const query = {};
       const result = await tutorsCollection.find(query).toArray();
       res.send(result);
+    });
+
+    // Application APIs-------------->
+    app.post("/applications", async (req, res) => {
+      try {
+        const application = req.body;
+
+        // Convert tuitionId string to ObjectId
+        application.tuitionId = new ObjectId(application.tuitionId);
+
+        application.status = "pending";
+        application.createdAt = new Date();
+
+        const result = await applicationsCollection.insertOne(application);
+        res.send(result);
+      } catch (error) {
+        console.error(error);
+        res.status(500).send({ message: "Failed to apply for tuition" });
+      }
+    });
+
+    app.get("/applications/tutor", async (req, res) => {
+      const email = req.query.email;
+
+      const result = await db
+        .collection("applications")
+        .find({ tutorEmail: email })
+        .toArray();
+
+      res.send(result);
+    });
+    app.get("/applications/student", async (req, res) => {
+      const email = req.query.email;
+
+      const result = await db
+        .collection("applications")
+        .find({ studentEmail: email })
+        .toArray();
+
+      res.send(result);
+    });
+
+    app.get("/applications/tuition/:id", async (req, res) => {
+      const tuitionId = req.params.id;
+
+      const result = await db
+        .collection("applications")
+        .find({ tuitionId: new ObjectId(tuitionId) }) // now works
+        .toArray();
+
+      res.send(result);
+    });
+
+    app.patch("/applications/:id", async (req, res) => {
+      const id = req.params.id;
+
+      const application = await applicationsCollection.findOne({
+        _id: new ObjectId(id),
+      });
+
+      if (!application) {
+        return res.status(404).send({ message: "Application not found" });
+      }
+
+      if (application.status === "accepted") {
+        return res
+          .status(403)
+          .send({ message: "Approved applications cannot be updated" });
+      }
+
+      const result = await applicationsCollection.updateOne(
+        { _id: new ObjectId(id) },
+        { $set: req.body }
+      );
+
+      res.send({ message: "Application updated successfully" });
+    });
+
+    app.delete("/applications/:id", async (req, res) => {
+      const id = req.params.id;
+
+      const application = await applicationsCollection.findOne({
+        _id: new ObjectId(id),
+      });
+
+      if (!application) {
+        return res.status(404).send({ message: "Application not found" });
+      }
+
+      if (application.status === "accepted") {
+        return res
+          .status(403)
+          .send({ message: "Approved applications cannot be deleted" });
+      }
+
+      const result = await applicationsCollection.deleteOne({
+        _id: new ObjectId(id),
+      });
+
+      res.send({ message: "Application deleted successfully" });
     });
 
     // TUITIONS APIs--------------->
