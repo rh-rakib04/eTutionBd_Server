@@ -36,7 +36,8 @@ async function run() {
     const applicationsCollection = db.collection("applications");
     const paymentsCollection = db.collection("payments");
 
-    // USERS APIs--------------->
+    // ----------------------------------------------
+    //--------------------->USERS APIs<---------------
 
     app.post("/users", async (req, res) => {
       const user = req.body;
@@ -54,7 +55,8 @@ async function run() {
       res.send({ role: user?.role || "student" });
     });
 
-    // TUTORS APIs--------------->
+    // ------------------------------------------------
+    //--------------------->TUTORS APIs<---------------
     app.post("/tutors", async (req, res) => {
       const tutor = req.body;
       tutor.status = "pending";
@@ -70,7 +72,62 @@ async function run() {
       res.send(result);
     });
 
-    // Payment APIs---------------->
+    app.get("/tutor/ongoing-tuitions", async (req, res) => {
+      try {
+        const email = req.query.email;
+        if (!email) {
+          return res.status(400).send({ message: "Tutor email required" });
+        }
+
+        // 1️ Find approved applications of tutor
+        const approvedApplications = await applicationsCollection
+          .find({
+            tutorEmail: email,
+            status: "approved",
+          })
+          .toArray();
+
+        if (approvedApplications.length === 0) {
+          return res.send([]);
+        }
+
+        //  Get tuition IDs
+        const tuitionIds = approvedApplications.map((app) => app.tuitionId);
+
+        //  Fetch tuition details
+        const tuitions = await tuitionsCollection
+          .find({ _id: { $in: tuitionIds } })
+          .toArray();
+
+        //  Merge tuition + application info
+        const ongoingTuitions = approvedApplications.map((app) => {
+          const tuition = tuitions.find(
+            (t) => t._id.toString() === app.tuitionId.toString()
+          );
+
+          return {
+            applicationId: app._id,
+            tuitionId: app.tuitionId,
+            subject: tuition?.subject,
+            classLevel: tuition?.classLevel,
+            location: tuition?.location,
+            salary: tuition?.salary,
+            studentEmail: tuition?.studentEmail,
+            tutorName: app.tutorName,
+            status: app.status,
+            assignedAt: app.createdAt,
+          };
+        });
+
+        res.send(ongoingTuitions);
+      } catch (error) {
+        console.error(error);
+        res.status(500).send({ message: "Failed to load ongoing tuitions" });
+      }
+    });
+
+    // --------------------------------------------------
+    //--------------------->Payment APIs<----------------
     app.post("/create-tutor-checkout-session", async (req, res) => {
       const { amount, tutorName, studentEmail, applicationId, tuitionId } =
         req.body;
@@ -112,47 +169,48 @@ async function run() {
     app.patch("/tutor-payment-success", async (req, res) => {
       try {
         const sessionId = req.query.session_id;
-        if (!sessionId)
-          return res
-            .status(400)
-            .send({ success: false, message: "Session ID missing" });
+        if (!sessionId) {
+          return res.status(400).send({ message: "Session ID missing" });
+        }
 
-        // Retrieve Stripe session
         const session = await stripe.checkout.sessions.retrieve(sessionId);
 
         if (session.payment_status !== "paid") {
-          return res.send({ success: false, message: "Payment not completed" });
+          return res.send({ message: "Payment not completed" });
         }
 
         const { applicationId, tuitionId, tutorName } = session.metadata;
         const transactionId = session.payment_intent;
         const amount = session.amount_total / 100;
 
-        // 1️⃣ Prevent duplicate payments
-        const existingPayment = await paymentsCollection.findOne({
-          transactionId,
-        });
-        if (existingPayment) {
+        // duplicate protection
+        const existing = await paymentsCollection.findOne({ transactionId });
+        if (existing) {
           return res.send({
             success: true,
-            message: "Payment already recorded",
-            tuitionName: existingPayment.tuitionName,
-            tutorName: existingPayment.tutorName,
+            message: "Payment already processed",
+            tuitionName: existing.tuitionName,
+            tutorName: existing.tutorName,
           });
         }
 
-        // 2️⃣ Fetch tuition info
+        // Get tuition subject
         const tuition = await tuitionsCollection.findOne({
           _id: new ObjectId(tuitionId),
         });
         const tuitionName = tuition?.subject || "Unknown Tuition";
 
-        // 3️⃣ Approve selected tutor & reject others
-        await applicationsCollection.updateOne(
-          { _id: new ObjectId(applicationId), status: { $ne: "approved" } },
+        //  Approve ONLY pending application
+        const approveResult = await applicationsCollection.updateOne(
+          { _id: new ObjectId(applicationId), status: "pending" },
           { $set: { status: "approved" } }
         );
 
+        if (approveResult.modifiedCount === 0) {
+          return res.send({ message: "Application already processed" });
+        }
+
+        // Reject others
         await applicationsCollection.updateMany(
           {
             tuitionId: new ObjectId(tuitionId),
@@ -161,38 +219,44 @@ async function run() {
           { $set: { status: "rejected" } }
         );
 
-        // 4️⃣ Mark tuition as assigned
+        //  Assign tuition
         await tuitionsCollection.updateOne(
-          { _id: new ObjectId(tuitionId), status: { $ne: "assigned" } },
+          { _id: new ObjectId(tuitionId) },
           { $set: { status: "assigned" } }
         );
 
-        // 5️⃣ Save payment record
-        const payment = {
-          _id: new ObjectId(),
+        // Save payment
+        await paymentsCollection.insertOne({
+          transactionId,
           amount,
           currency: session.currency,
           studentEmail: session.customer_email,
-          transactionId,
           tuitionId,
           applicationId,
           tutorName,
-          tuitionName, // save the subject here
-          paymentStatus: session.payment_status,
+          tuitionName,
+          paymentStatus: "paid",
           paidAt: new Date(),
-        };
-
-        await paymentsCollection.insertOne(payment);
+        });
 
         res.send({
           success: true,
-          message: "Payment recorded successfully",
+          message: "Payment successful",
           tuitionName,
           tutorName,
         });
       } catch (error) {
         console.error(error);
-        res.status(500).send({ success: false, message: error.message });
+
+        // Duplicate index error handling
+        if (error.code === 11000) {
+          return res.send({
+            success: true,
+            message: "Duplicate ignored safely",
+          });
+        }
+
+        res.status(500).send({ message: "Payment processing failed" });
       }
     });
 
@@ -226,7 +290,8 @@ async function run() {
       }
     });
 
-    // Application APIs-------------->
+    // ----------------------------------------------------
+    //--------------------->Application APIs<--------------
     app.post("/applications", async (req, res) => {
       try {
         const application = req.body;
@@ -389,7 +454,8 @@ async function run() {
       res.send({ message: "Application deleted successfully" });
     });
 
-    // TUITIONS APIs--------------->
+    // --------------------------------------------------
+    //--------------------->TUITIONS APIs<---------------
     app.get("/tuitions", async (req, res) => {
       const email = req.query.email;
 
