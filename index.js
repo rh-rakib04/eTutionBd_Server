@@ -15,6 +15,9 @@ const client = new MongoClient(uri, {
     deprecationErrors: true,
   },
 });
+
+const stripe = require("stripe")(process.env.STRIPE_KEY);
+
 // -----------------------------
 // Middlewares
 // -----------------------------
@@ -31,6 +34,7 @@ async function run() {
     const tutorsCollection = db.collection("tutors");
     const tuitionsCollection = db.collection("tuitions");
     const applicationsCollection = db.collection("applications");
+    const paymentsCollection = db.collection("payments");
 
     // USERS APIs--------------->
 
@@ -66,6 +70,162 @@ async function run() {
       res.send(result);
     });
 
+    // Payment APIs---------------->
+    app.post("/create-tutor-checkout-session", async (req, res) => {
+      const { amount, tutorName, studentEmail, applicationId, tuitionId } =
+        req.body;
+
+      // Fetch tuition name
+      const tuition = await tuitionsCollection.findOne({
+        _id: new ObjectId(tuitionId),
+      });
+      const subject = tuition?.subject || "Unknown Tuition";
+
+      const session = await stripe.checkout.sessions.create({
+        line_items: [
+          {
+            price_data: {
+              currency: "BDT",
+              unit_amount: amount * 100,
+              product_data: {
+                name: `Tutor Payment - ${tutorName} (${subject})`,
+              },
+            },
+            quantity: 1,
+          },
+        ],
+        mode: "payment",
+        customer_email: studentEmail,
+        metadata: {
+          applicationId,
+          tuitionId,
+          tutorName,
+          subject,
+        },
+        success_url: `${process.env.SITE_DOMAIN}/dashboard/payment-success?session_id={CHECKOUT_SESSION_ID}`,
+        cancel_url: `${process.env.SITE_DOMAIN}/dashboard/payment-cancelled`,
+      });
+
+      res.send({ url: session.url });
+    });
+
+    app.patch("/tutor-payment-success", async (req, res) => {
+      try {
+        const sessionId = req.query.session_id;
+        if (!sessionId)
+          return res
+            .status(400)
+            .send({ success: false, message: "Session ID missing" });
+
+        // Retrieve Stripe session
+        const session = await stripe.checkout.sessions.retrieve(sessionId);
+
+        if (session.payment_status !== "paid") {
+          return res.send({ success: false, message: "Payment not completed" });
+        }
+
+        const { applicationId, tuitionId, tutorName } = session.metadata;
+        const transactionId = session.payment_intent;
+        const amount = session.amount_total / 100;
+
+        // 1️⃣ Prevent duplicate payments
+        const existingPayment = await paymentsCollection.findOne({
+          transactionId,
+        });
+        if (existingPayment) {
+          return res.send({
+            success: true,
+            message: "Payment already recorded",
+            tuitionName: existingPayment.tuitionName,
+            tutorName: existingPayment.tutorName,
+          });
+        }
+
+        // 2️⃣ Fetch tuition info
+        const tuition = await tuitionsCollection.findOne({
+          _id: new ObjectId(tuitionId),
+        });
+        const tuitionName = tuition?.subject || "Unknown Tuition";
+
+        // 3️⃣ Approve selected tutor & reject others
+        await applicationsCollection.updateOne(
+          { _id: new ObjectId(applicationId), status: { $ne: "approved" } },
+          { $set: { status: "approved" } }
+        );
+
+        await applicationsCollection.updateMany(
+          {
+            tuitionId: new ObjectId(tuitionId),
+            _id: { $ne: new ObjectId(applicationId) },
+          },
+          { $set: { status: "rejected" } }
+        );
+
+        // 4️⃣ Mark tuition as assigned
+        await tuitionsCollection.updateOne(
+          { _id: new ObjectId(tuitionId), status: { $ne: "assigned" } },
+          { $set: { status: "assigned" } }
+        );
+
+        // 5️⃣ Save payment record
+        const payment = {
+          _id: new ObjectId(),
+          amount,
+          currency: session.currency,
+          studentEmail: session.customer_email,
+          transactionId,
+          tuitionId,
+          applicationId,
+          tutorName,
+          tuitionName, // save the subject here
+          paymentStatus: session.payment_status,
+          paidAt: new Date(),
+        };
+
+        await paymentsCollection.insertOne(payment);
+
+        res.send({
+          success: true,
+          message: "Payment recorded successfully",
+          tuitionName,
+          tutorName,
+        });
+      } catch (error) {
+        console.error(error);
+        res.status(500).send({ success: false, message: error.message });
+      }
+    });
+
+    app.get("/payments", async (req, res) => {
+      try {
+        const email = req.query.email;
+        if (!email) return res.status(400).send({ message: "Email required" });
+
+        const payments = await paymentsCollection
+          .find({ studentEmail: email })
+          .sort({ paidAt: -1 })
+          .toArray();
+
+        // Add tuition subject for each payment
+        const paymentsWithSubject = await Promise.all(
+          payments.map(async (p) => {
+            if (!p.tuitionName) {
+              const tuition = await tuitionsCollection.findOne({
+                _id: new ObjectId(p.tuitionId),
+              });
+              p.tuitionName = tuition?.subject || "Unknown Tuition";
+            }
+            return p;
+          })
+        );
+
+        res.send(paymentsWithSubject);
+      } catch (error) {
+        console.error(error);
+        res.status(500).send({ message: "Failed to fetch payments" });
+      }
+    });
+
     // Application APIs-------------->
     app.post("/applications", async (req, res) => {
       try {
@@ -95,26 +255,39 @@ async function run() {
 
       res.send(result);
     });
-    app.get("/applications/student", async (req, res) => {
-      const email = req.query.email;
 
-      const result = await db
-        .collection("applications")
-        .find({ studentEmail: email })
+    app.get("/applications/tuition/:id", async (req, res) => {
+      const tuitionId = req.params.id;
+
+      const result = await applicationsCollection
+        .find({ tuitionId: new ObjectId(tuitionId) })
         .toArray();
 
       res.send(result);
     });
 
-    app.get("/applications/tuition/:id", async (req, res) => {
-      const tuitionId = req.params.id;
+    app.get("/applications/student", async (req, res) => {
+      const email = req.query.email;
 
-      const result = await db
-        .collection("applications")
-        .find({ tuitionId: new ObjectId(tuitionId) }) // now works
+      if (!email) {
+        return res.send([]);
+      }
+
+      // Step 1: find all tuitions posted by this student
+      const tuitions = await tuitionsCollection
+        .find({ studentEmail: email })
+        .project({ _id: 1 })
         .toArray();
 
-      res.send(result);
+      // Step 2: get tuition IDs
+      const tuitionIds = tuitions.map((t) => t._id);
+
+      // Step 3: find applications for those tuitions
+      const applications = await applicationsCollection
+        .find({ tuitionId: { $in: tuitionIds } })
+        .toArray();
+
+      res.send(applications);
     });
 
     app.patch("/applications/:id", async (req, res) => {
@@ -140,6 +313,56 @@ async function run() {
       );
 
       res.send({ message: "Application updated successfully" });
+    });
+    app.patch("/applications/approve/:id", async (req, res) => {
+      const id = req.params.id;
+
+      // 1️⃣ Get the approved application
+      const application = await applicationsCollection.findOne({
+        _id: new ObjectId(id),
+      });
+
+      if (!application) {
+        return res.status(404).send({ message: "Application not found" });
+      }
+
+      if (application.status !== "pending") {
+        return res.send({ message: "Already processed" });
+      }
+
+      // 2️⃣ Approve selected tutor
+      await applicationsCollection.updateOne(
+        { _id: new ObjectId(id) },
+        { $set: { status: "approved" } }
+      );
+
+      // 3️⃣ Reject all other tutors for SAME tuition
+      await applicationsCollection.updateMany(
+        {
+          tuitionId: application.tuitionId,
+          _id: { $ne: new ObjectId(id) },
+        },
+        { $set: { status: "rejected" } }
+      );
+
+      // 4️⃣ Mark tuition as assigned
+      await tuitionsCollection.updateOne(
+        { _id: application.tuitionId },
+        { $set: { status: "assigned" } }
+      );
+
+      res.send({ message: "Tutor approved & others rejected" });
+    });
+
+    app.patch("/applications/reject/:id", async (req, res) => {
+      const id = req.params.id;
+
+      await applicationsCollection.updateOne(
+        { _id: new ObjectId(id) },
+        { $set: { status: "rejected" } }
+      );
+
+      res.send({ message: "Tutor rejected" });
     });
 
     app.delete("/applications/:id", async (req, res) => {
