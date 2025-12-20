@@ -36,6 +36,20 @@ async function run() {
     const applicationsCollection = db.collection("applications");
     const paymentsCollection = db.collection("payments");
 
+    // ----------------------------------------------------
+    //--------------------->Admin Middleware<---------------
+    // const verifyAdmin = async (req, res, next) => {
+    //   const email = req.decodedEmail;
+
+    //   const user = await usersCollection.findOne({ email });
+
+    //   if (!user || user.role !== "admin") {
+    //     return res.status(403).send({ message: "Forbidden access" });
+    //   }
+
+    //   next();
+    // };
+
     // ----------------------------------------------
     //--------------------->USERS APIs<---------------
 
@@ -55,6 +69,82 @@ async function run() {
       res.send({ role: user?.role || "student" });
     });
 
+    app.get("/users", async (req, res) => {
+      const result = await usersCollection
+        .find()
+        .sort({ createdAt: -1 })
+        .toArray();
+
+      res.send(result);
+    });
+
+    app.patch("/users/:id", async (req, res) => {
+      const id = req.params.id;
+      const updatedData = req.body;
+
+      const result = await usersCollection.updateOne(
+        { _id: new ObjectId(id) },
+        { $set: updatedData }
+      );
+
+      res.send(result);
+    });
+
+    app.patch("/users/:id/role", async (req, res) => {
+      const id = req.params.id;
+      const { role } = req.body;
+
+      const result = await usersCollection.updateOne(
+        { _id: new ObjectId(id) },
+        { $set: { role } }
+      );
+
+      res.send(result);
+    });
+
+    app.patch("/users/:id/status", async (req, res) => {
+      const id = req.params.id;
+      const { status } = req.body; // active | blocked
+
+      const result = await usersCollection.updateOne(
+        { _id: new ObjectId(id) },
+        { $set: { status } }
+      );
+
+      res.send(result);
+    });
+
+    app.patch("/users/:email", async (req, res) => {
+      const email = req.params.email;
+      const { displayName, photoURL, age, address, phone, bio } = req.body;
+
+      const result = await usersCollection.updateOne(
+        { email },
+        {
+          $set: {
+            displayName,
+            photoURL,
+            age,
+            address,
+            phone,
+            bio,
+          },
+        }
+      );
+
+      res.send(result);
+    });
+
+    app.delete("/users/:id", async (req, res) => {
+      const id = req.params.id;
+
+      const result = await usersCollection.deleteOne({
+        _id: new ObjectId(id),
+      });
+
+      res.send(result);
+    });
+
     // ------------------------------------------------
     //--------------------->TUTORS APIs<---------------
     app.post("/tutors", async (req, res) => {
@@ -68,7 +158,7 @@ async function run() {
 
     app.get("/tutors", async (req, res) => {
       const query = {};
-      const result = await tutorsCollection.find(query).toArray();
+      const result = await tutorsCollection.find(query).sort({ createdAt: -1 }).toArray();
       res.send(result);
     });
 
@@ -91,10 +181,12 @@ async function run() {
           return res.send([]);
         }
 
-        //  Get tuition IDs
-        const tuitionIds = approvedApplications.map((app) => app.tuitionId);
+        const tuitionIds = approvedApplications.map((app) =>
+          typeof app.tuitionId === "string"
+            ? new ObjectId(app.tuitionId)
+            : app.tuitionId
+        );
 
-        //  Fetch tuition details
         const tuitions = await tuitionsCollection
           .find({ _id: { $in: tuitionIds } })
           .toArray();
@@ -107,13 +199,15 @@ async function run() {
 
           return {
             applicationId: app._id,
-            tuitionId: app.tuitionId,
+            tuitionId: tuition._id,
             subject: tuition?.subject,
             classLevel: tuition?.classLevel,
             location: tuition?.location,
             salary: tuition?.salary,
             studentEmail: tuition?.studentEmail,
             tutorName: app.tutorName,
+            tuitionStatus: tuition?.status,
+            tuitionId: tuition?._id,
             status: app.status,
             assignedAt: app.createdAt,
           };
@@ -179,11 +273,12 @@ async function run() {
           return res.send({ message: "Payment not completed" });
         }
 
+        // Extract metadata
         const { applicationId, tuitionId, tutorName } = session.metadata;
         const transactionId = session.payment_intent;
         const amount = session.amount_total / 100;
 
-        // duplicate protection
+        // Check for duplicate payment
         const existing = await paymentsCollection.findOne({ transactionId });
         if (existing) {
           return res.send({
@@ -194,23 +289,21 @@ async function run() {
           });
         }
 
-        // Get tuition subject
-        const tuition = await tuitionsCollection.findOne({
-          _id: new ObjectId(tuitionId),
+        // Fetch application to get tutorEmail
+        const application = await applicationsCollection.findOne({
+          _id: new ObjectId(applicationId),
         });
-        const tuitionName = tuition?.subject || "Unknown Tuition";
+        if (!application) {
+          return res.status(404).send({ message: "Application not found" });
+        }
 
-        //  Approve ONLY pending application
-        const approveResult = await applicationsCollection.updateOne(
-          { _id: new ObjectId(applicationId), status: "pending" },
+        // Approve tutor
+        await applicationsCollection.updateOne(
+          { _id: new ObjectId(applicationId) },
           { $set: { status: "approved" } }
         );
 
-        if (approveResult.modifiedCount === 0) {
-          return res.send({ message: "Application already processed" });
-        }
-
-        // Reject others
+        // Reject other tutors for same tuition
         await applicationsCollection.updateMany(
           {
             tuitionId: new ObjectId(tuitionId),
@@ -219,44 +312,35 @@ async function run() {
           { $set: { status: "rejected" } }
         );
 
-        //  Assign tuition
+        // Mark tuition as assigned
         await tuitionsCollection.updateOne(
           { _id: new ObjectId(tuitionId) },
           { $set: { status: "assigned" } }
         );
 
-        // Save payment
+        // Save payment with tutorEmail
         await paymentsCollection.insertOne({
           transactionId,
           amount,
           currency: session.currency,
           studentEmail: session.customer_email,
-          tuitionId,
-          applicationId,
+          tutorEmail: application.tutorEmail,
           tutorName,
-          tuitionName,
+          tuitionId,
+          tuitionName: session.metadata.subject,
           paymentStatus: "paid",
           paidAt: new Date(),
         });
 
-        res.send({
+        return res.send({
           success: true,
           message: "Payment successful",
-          tuitionName,
+          tuitionName: session.metadata.subject,
           tutorName,
         });
       } catch (error) {
         console.error(error);
-
-        // Duplicate index error handling
-        if (error.code === 11000) {
-          return res.send({
-            success: true,
-            message: "Duplicate ignored safely",
-          });
-        }
-
-        res.status(500).send({ message: "Payment processing failed" });
+        return res.status(500).send({ message: "Payment processing failed" });
       }
     });
 
@@ -288,6 +372,19 @@ async function run() {
         console.error(error);
         res.status(500).send({ message: "Failed to fetch payments" });
       }
+    });
+
+    app.get("/payments/tutor", async (req, res) => {
+      const email = req.query.email;
+      if (!email)
+        return res.status(400).send({ message: "Tutor email required" });
+
+      const payments = await paymentsCollection
+        .find({ tutorEmail: email })
+        .sort({ paidAt: -1 })
+        .toArray();
+
+      res.send(payments);
     });
 
     // ----------------------------------------------------
@@ -458,12 +555,21 @@ async function run() {
     //--------------------->TUITIONS APIs<---------------
     app.get("/tuitions", async (req, res) => {
       const email = req.query.email;
+      const role = req.query.role;
+      const status = req.query.status;
 
-      const query = {};
-      if (email) {
+      let query = {};
+
+      if (role === "student" && email) {
         query.studentEmail = email;
       }
 
+      if (role === "tutor") {
+        query.status = "active";
+      }
+      if (status) {
+        query.status = status;
+      }
       const result = await tuitionsCollection
         .find(query)
         .sort({ createdAt: -1 })
@@ -489,10 +595,22 @@ async function run() {
     });
 
     app.post("/tuitions", async (req, res) => {
-      const tuition = req.body;
-      tuition.createdAt = new Date();
-      tuition.status = "active";
-      tuition.appliedTutors = [];
+      const { subject, classLevel, location, salary, studentEmail } = req.body;
+
+      if (!subject || !classLevel || !location || !salary || !studentEmail) {
+        return res.status(400).send({ message: "All fields are required" });
+      }
+
+      const tuition = {
+        subject,
+        classLevel,
+        location,
+        salary,
+        studentEmail,
+        createdAt: new Date(),
+        status: "pending",
+        appliedTutors: [],
+      };
 
       const result = await tuitionsCollection.insertOne(tuition);
       res.send(result);
@@ -500,14 +618,14 @@ async function run() {
 
     app.patch("/tuitions/:id", async (req, res) => {
       const id = req.params.id;
-      const updatedData = req.body;
+      const { status } = req.body;
 
       const result = await tuitionsCollection.updateOne(
         { _id: new ObjectId(id) },
-        { $set: updatedData }
+        { $set: { status } }
       );
 
-      res.send(result);
+      res.send({ success: true, modifiedCount: result.modifiedCount });
     });
 
     app.delete("/tuitions/:id", async (req, res) => {
