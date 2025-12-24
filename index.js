@@ -7,7 +7,13 @@ const app = express();
 const port = process.env.PORT || 5000;
 
 const admin = require("firebase-admin");
-
+app.use(express.json());
+app.use(
+  cors({
+    origin: ["https://etutionbd-rh.web.app", "http://localhost:5173"],
+    credentials: true,
+  })
+);
 // Decode base64 string back into JSON
 const decoded = Buffer.from(process.env.FB_SERVICE_KEY, "base64").toString(
   "utf8"
@@ -53,14 +59,6 @@ const stripe = require("stripe")(process.env.STRIPE_KEY);
 // -----------------------------
 // Middlewares
 // -----------------------------
-app.use(express.json());
-app.use(
-  cors({
-    origin: "http://localhost:5173", // your frontend dev server
-    credentials: true, // allow cookies/authorization headers
-    allowedHeaders: ["Content-Type", "Authorization"],
-  })
-);
 
 //------------------------------
 //------------------------------
@@ -103,7 +101,6 @@ async function run() {
       try {
         const user = req.body;
 
-        // Normalize email
         if (!user.email) {
           return res
             .status(400)
@@ -120,7 +117,6 @@ async function run() {
           return res.send({ success: true, message: "User already exists" });
         }
 
-        // Insert new user
         const result = await usersCollection.insertOne(user);
         res.send({ success: true, insertedId: result.insertedId });
       } catch (error) {
@@ -255,7 +251,7 @@ async function run() {
 
     // ------------------------------------------------
     // ---------------------> TUTORS APIs <------------
-    app.post("/tutors", verifyFBToken, verifyTutor, async (req, res) => {
+    app.post("/tutors", async (req, res) => {
       try {
         const tutor = req.body;
         tutor.email = tutor.email.toLowerCase();
@@ -751,32 +747,90 @@ async function run() {
     // ---------------------> TUITIONS APIs <------------
     app.get("/tuitions", async (req, res) => {
       try {
-        const email = req.query.email?.toLowerCase();
-        const role = req.query.role;
-        const status = req.query.status;
+        const {
+          email,
+          role,
+          status,
+          subject,
+          location,
+          classLevel,
+          sortBy,
+          order = "desc",
+          page = 1,
+          limit = 10,
+          minSalary,
+          maxSalary,
+        } = req.query;
 
         let query = {};
 
+        // Role-based filtering
         if (role === "student" && email) {
-          query.studentEmail = email;
+          query.studentEmail = email.toLowerCase();
         }
-
         if (role === "tutor") {
           query.status = "active";
         }
-
         if (status) {
           query.status = status;
         }
 
-        const result = await tuitionsCollection
+        // Search filters
+        if (subject) query.subject = { $regex: subject, $options: "i" };
+        if (location) query.location = { $regex: location, $options: "i" };
+        if (classLevel) query.classLevel = classLevel;
+
+        // Salary range filter
+        if (minSalary || maxSalary) {
+          query.salary = {};
+          if (minSalary) query.salary.$gte = parseInt(minSalary);
+          if (maxSalary) query.salary.$lte = parseInt(maxSalary);
+        }
+
+        // Sorting
+        let sort = {};
+        if (sortBy === "budget") sort.salary = order === "asc" ? 1 : -1;
+        else if (sortBy === "date") sort.createdAt = order === "asc" ? 1 : -1;
+        else sort.createdAt = -1; // default sort by newest
+
+        // Pagination
+        const skip = (parseInt(page) - 1) * parseInt(limit);
+
+        const tuitions = await tuitionsCollection
           .find(query)
-          .sort({ createdAt: -1 })
+          .sort(sort)
+          .skip(skip)
+          .limit(parseInt(limit))
           .toArray();
-        res.send(result);
+
+        const total = await tuitionsCollection.countDocuments(query);
+
+        res.send({
+          success: true,
+          total,
+          page: parseInt(page),
+          limit: parseInt(limit),
+          tuitions,
+        });
       } catch (error) {
         console.error("Error fetching tuitions:", error.message);
         res.status(500).send({ message: "Failed to fetch tuitions" });
+      }
+    });
+
+    app.get("/my-tuitions", async (req, res) => {
+      try {
+        const email = req.query.email?.toLowerCase();
+        if (!email) return res.status(400).send({ message: "Email required" });
+
+        const tuitions = await tuitionsCollection
+          .find({ studentEmail: email })
+          .sort({ createdAt: -1 })
+          .toArray();
+
+        res.send(tuitions);
+      } catch (error) {
+        res.status(500).send({ message: "Failed to fetch my tuitions" });
       }
     });
 
@@ -915,7 +969,7 @@ async function run() {
         const tutorId = req.params.tutorId;
 
         const reviews = await reviewsCollection
-          .find({ tutorId }) // keep tutorId as string consistently
+          .find({ tutorId })
           .sort({ createdAt: -1 })
           .toArray();
 
@@ -937,7 +991,6 @@ async function run() {
   }
 }
 run().catch(console.dir);
-
 
 app.get("/", (req, res) => {
   res.send("ETutionBd running ....!");
